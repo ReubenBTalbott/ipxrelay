@@ -1,0 +1,116 @@
+# Auto-build workflow for ipxrelay
+# - Runs on a weekly schedule to keep GitHub Actions active and to rebuild when parent images may have changed.
+# - Also supports manual dispatch and repository_dispatch (you can trigger from another repo when upstream changes).
+# - Only pushes the image if the upstream repository (fragglet/ipxbox) has a new commit.
+
+name: Auto build and publish
+
+on:
+  schedule:
+    # Run weekly at 03:00 UTC on Sunday
+    - cron: '0 3 * * 0'
+  workflow_dispatch: {}
+  repository_dispatch: {}
+  push:
+    branches:
+      - main
+      - master
+
+concurrency:
+  group: ipxrelay-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure build tags
+        id: meta
+        run: |
+          # Ensure repository name is lowercase
+          REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE_NAME="ghcr.io/$REPO"
+          echo "IMAGE=${IMAGE_NAME}" >> $GITHUB_OUTPUT
+          
+      - name: Check upstream for changes
+        id: check_upstream
+        run: |
+          # Get the latest commit SHA of the upstream repository
+          UPSTREAM_REPO="fragglet/ipxbox"
+          UPSTREAM_SHA=$(curl -s "https://api.github.com/repos/${UPSTREAM_REPO}/commits/master" | grep -m 1 '"sha":' | cut -d '"' -f 4)
+          
+          echo "Upstream SHA: $UPSTREAM_SHA"
+          echo "upstream_sha=${UPSTREAM_SHA}" >> $GITHUB_OUTPUT
+          
+          # Try to get the upstream SHA from the labels of our latest published image using Docker manifest inspect
+          # If the image doesn't exist or doesn't have the label, it will fall back to 'none'
+          export DOCKER_CLI_EXPERIMENTAL=enabled
+          
+          # Use skopeo to inspect the remote image labels without downloading it
+          LAST_BUILT_SHA=$(docker buildx imagetools inspect ${{ steps.meta.outputs.IMAGE }}:latest --format '{{ index .Image.Config.Labels "org.opencontainers.image.revision" }}' 2>/dev/null || echo "none")
+          
+          echo "Last built upstream SHA: $LAST_BUILT_SHA"
+          
+          # We only push if it's a direct push event to the repo OR if the upstream code has changed
+          if [ "${{ github.event_name }}" == "push" ]; then
+            echo "Push event detected. Forcing build and push."
+            echo "PUSH=true" >> $GITHUB_OUTPUT
+          elif [ "$UPSTREAM_SHA" == "$LAST_BUILT_SHA" ] && [ "$LAST_BUILT_SHA" != "none" ] && [ -n "$UPSTREAM_SHA" ]; then
+            echo "No changes in upstream repository. Skipping build."
+            echo "PUSH=false" >> $GITHUB_OUTPUT
+          else
+            echo "Upstream has changed or no previous build found. Proceeding with build."
+            echo "PUSH=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up QEMU
+        if: ${{ steps.check_upstream.outputs.PUSH == 'true' }}
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: ${{ steps.check_upstream.outputs.PUSH == 'true' }}
+        uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-flags: --debug
+
+      - name: Build and push
+        if: ${{ steps.check_upstream.outputs.PUSH == 'true' }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # Add the upstream SHA as a label to the image so we can check it next time
+          labels: |
+            org.opencontainers.image.revision=${{ steps.check_upstream.outputs.upstream_sha }}
+            org.opencontainers.image.source=https://github.com/fragglet/ipxbox
+          tags: |
+            ${{ steps.meta.outputs.IMAGE }}:latest
+            ${{ steps.meta.outputs.IMAGE }}:${{ steps.check_upstream.outputs.upstream_sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Annotate build result
+        if: ${{ steps.check_upstream.outputs.PUSH == 'true' }}
+        run: |
+          echo "Image pushed: ${{ steps.meta.outputs.IMAGE }}:latest"
+          echo "Upstream SHA built: ${{ steps.check_upstream.outputs.upstream_sha }}"
