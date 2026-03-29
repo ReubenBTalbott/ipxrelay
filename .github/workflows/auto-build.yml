@@ -13,7 +13,6 @@ on:
   repository_dispatch: {}
   push:
     branches:
-      - main
       - master
 
 concurrency:
@@ -24,6 +23,8 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPO: fragglet/ipxbox
     permissions:
       contents: read
       packages: write
@@ -35,6 +36,42 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Determine image name
+        id: image
+        run: |
+          set -euo pipefail
+          REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${REPO}" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch upstream info
+        id: upstream
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = "fragglet";
+            const repo = "ipxbox";
+            const { data: repoInfo } = await github.rest.repos.get({ owner, repo });
+            const defaultBranch = repoInfo.default_branch;
+            const { data: commit } = await github.rest.repos.getCommit({ owner, repo, ref: defaultBranch });
+            core.setOutput('branch', defaultBranch);
+            core.setOutput('sha', commit.sha);
+
+      - name: Install regctl
+        uses: regclient/actions/regctl-installer@main
+
+      - name: Capture base image digests
+        id: base
+        run: |
+          set -euo pipefail
+          BUILD_IMAGE="golang:alpine"
+          RUNTIME_IMAGE="alpine:latest"
+          BUILD_DIGEST=$(regctl image digest "docker.io/library/${BUILD_IMAGE}")
+          RUNTIME_DIGEST=$(regctl image digest "docker.io/library/${RUNTIME_IMAGE}")
+          echo "build_ref=${BUILD_IMAGE}@${BUILD_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "runtime_ref=${RUNTIME_IMAGE}@${RUNTIME_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "build_digest=${BUILD_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "runtime_digest=${RUNTIME_DIGEST}" >> "$GITHUB_OUTPUT"
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -42,75 +79,108 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Configure build tags
-        id: meta
+      - name: regctl login
+        uses: regclient/actions/regctl-login@main
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Inspect last published image
+        id: last
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
         run: |
-          # Ensure repository name is lowercase
-          REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          IMAGE_NAME="ghcr.io/$REPO"
-          echo "IMAGE=${IMAGE_NAME}" >> $GITHUB_OUTPUT
-          
-      - name: Check upstream for changes
-        id: check_upstream
-        run: |
-          # Get the latest commit SHA of the upstream repository
-          UPSTREAM_REPO="fragglet/ipxbox"
-          UPSTREAM_SHA=$(curl -s "https://api.github.com/repos/${UPSTREAM_REPO}/commits/master" | grep -m 1 '"sha":' | cut -d '"' -f 4)
-          
-          echo "Upstream SHA: $UPSTREAM_SHA"
-          echo "upstream_sha=${UPSTREAM_SHA}" >> $GITHUB_OUTPUT
-          
-          # Try to get the upstream SHA from the labels of our latest published image using Docker manifest inspect
-          # If the image doesn't exist or doesn't have the label, it will fall back to 'none'
-          export DOCKER_CLI_EXPERIMENTAL=enabled
-          
-          # Use skopeo to inspect the remote image labels without downloading it
-          LAST_BUILT_SHA=$(docker buildx imagetools inspect ${{ steps.meta.outputs.IMAGE }}:latest --format '{{ index .Image.Config.Labels "org.opencontainers.image.revision" }}' 2>/dev/null || echo "none")
-          
-          echo "Last built upstream SHA: $LAST_BUILT_SHA"
-          
-          # We only push if it's a direct push event to the repo OR if the upstream code has changed
-          if [ "${{ github.event_name }}" == "push" ]; then
-            echo "Push event detected. Forcing build and push."
-            echo "PUSH=true" >> $GITHUB_OUTPUT
-          elif [ "$UPSTREAM_SHA" == "$LAST_BUILT_SHA" ] && [ "$LAST_BUILT_SHA" != "none" ] && [ -n "$UPSTREAM_SHA" ]; then
-            echo "No changes in upstream repository. Skipping build."
-            echo "PUSH=false" >> $GITHUB_OUTPUT
-          else
-            echo "Upstream has changed or no previous build found. Proceeding with build."
-            echo "PUSH=true" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          if ! regctl manifest get "${IMAGE}:latest" --format '{{json .config.labels}}' > labels.json; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          LAST_UPSTREAM=$(jq -r '."org.opencontainers.image.revision" // "none"' labels.json)
+          LAST_BASE_BUILD=$(jq -r '."org.ipxrelay.base.build" // "none"' labels.json)
+          LAST_BASE_RUNTIME=$(jq -r '."org.ipxrelay.base.runtime" // "none"' labels.json)
+
+          echo "upstream_sha=${LAST_UPSTREAM}" >> "$GITHUB_OUTPUT"
+          echo "base_build=${LAST_BASE_BUILD}" >> "$GITHUB_OUTPUT"
+          echo "base_runtime=${LAST_BASE_RUNTIME}" >> "$GITHUB_OUTPUT"
+          LAST_DIGEST=$(regctl image digest "${IMAGE}:latest")
+          echo "image_digest=${LAST_DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.image }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ steps.upstream.outputs.branch }}-${{ steps.upstream.outputs.sha }}
+            type=sha
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.upstream.outputs.sha }}
+            org.ipxrelay.upstream.branch=${{ steps.upstream.outputs.branch }}
+            org.ipxrelay.base.build=${{ steps.base.outputs.build_ref }}
+            org.ipxrelay.base.runtime=${{ steps.base.outputs.runtime_ref }}
+
+      - name: Decide whether to push
+        id: decide
+        uses: actions/github-script@v7
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          LAST_FOUND: ${{ steps.last.outputs.found }}
+          LAST_UPSTREAM_SHA: ${{ steps.last.outputs.upstream_sha }}
+          BASE_BUILD_REF: ${{ steps.base.outputs.build_ref }}
+          BASE_RUNTIME_REF: ${{ steps.base.outputs.runtime_ref }}
+          LAST_BASE_BUILD: ${{ steps.last.outputs.base_build }}
+          LAST_BASE_RUNTIME: ${{ steps.last.outputs.base_runtime }}
+        with:
+          script: |
+            const pushEvent = process.env.EVENT_NAME === 'push';
+            const lastFound = process.env.LAST_FOUND === 'true';
+            const diffs = [];
+            if (!lastFound) {
+              diffs.push('no_previous_image');
+            }
+            if (process.env.UPSTREAM_SHA && process.env.UPSTREAM_SHA !== (process.env.LAST_UPSTREAM_SHA || '')) {
+              diffs.push('upstream_changed');
+            }
+            if (process.env.BASE_BUILD_REF && process.env.BASE_BUILD_REF !== (process.env.LAST_BASE_BUILD || '')) {
+              diffs.push('builder_base_changed');
+            }
+            if (process.env.BASE_RUNTIME_REF && process.env.BASE_RUNTIME_REF !== (process.env.LAST_BASE_RUNTIME || '')) {
+              diffs.push('runtime_base_changed');
+            }
+            const shouldPush = pushEvent || diffs.length > 0;
+            core.setOutput('push', shouldPush ? 'true' : 'false');
+            core.setOutput('reasons', diffs.join(','));
+
       - name: Set up QEMU
-        if: ${{ steps.check_upstream.outputs.PUSH == 'true' }}
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
-        if: ${{ steps.check_upstream.outputs.PUSH == 'true' }}
         uses: docker/setup-buildx-action@v3
         with:
           buildkitd-flags: --debug
 
-      - name: Build and push
-        if: ${{ steps.check_upstream.outputs.PUSH == 'true' }}
+      - name: Build image
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: true
-          # Add the upstream SHA as a label to the image so we can check it next time
-          labels: |
-            org.opencontainers.image.revision=${{ steps.check_upstream.outputs.upstream_sha }}
-            org.opencontainers.image.source=https://github.com/fragglet/ipxbox
-          tags: |
-            ${{ steps.meta.outputs.IMAGE }}:latest
-            ${{ steps.meta.outputs.IMAGE }}:${{ steps.check_upstream.outputs.upstream_sha }}
+          push: ${{ steps.decide.outputs.push == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Annotate build result
-        if: ${{ steps.check_upstream.outputs.PUSH == 'true' }}
+      - name: Build summary
         run: |
-          echo "Image pushed: ${{ steps.meta.outputs.IMAGE }}:latest"
-          echo "Upstream SHA built: ${{ steps.check_upstream.outputs.upstream_sha }}"
+          echo "Push decision: ${{ steps.decide.outputs.push }}"
+          echo "Reasons: ${{ steps.decide.outputs.reasons }}"
+          echo "Image tags:"
+          echo '${{ steps.meta.outputs.tags }}'
